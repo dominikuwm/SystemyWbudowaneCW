@@ -1,0 +1,147 @@
+/*************************************************************
+ *  LED‑demo • PIC24FJ128GA010  (Explorer 16 / własna płytka)
+ *  ‑ dziewięć efektów na diodach LED podłączonych do PORTA
+ *  ‑ S6 (RD6) – następny efekt
+ *  ‑ S7 (RD7) – poprzedni efekt   ← przeniesione z RD13
+ *  Wersja 2025‑05‑11, poprawiona wg uwag z recenzji.
+ *************************************************************/
+
+#define FCY 4000000UL          // 8 MHz FRC ÷ 2  ⇒ 4 MHz
+#include "xc.h"
+#include <stdint.h>
+#include <libpic30.h>          // __delay32()
+
+/* ----------------------------------------------------------
+ *  Konfiguracja fuse‑bitów
+ * ---------------------------------------------------------- */
+#pragma config POSCMOD = NONE        // brak zewn. oscylatora
+#pragma config FNOSC   = FRC         // wewn. RC 8 MHz
+#pragma config FCKSM   = CSDCMD      // bez Clock‑Switch / Fail‑Safe
+#pragma config OSCIOFNC= OFF, IESO = OFF
+#pragma config WDTPS   = PS32768, FWPSA = PR128, FWDTEN = OFF
+#pragma config WINDIS  = ON
+#pragma config ICS     = PGx2        // PGEC2/PGED2 na RB6/RB7
+#pragma config GWRP=OFF, GCP=OFF, JTAGEN=OFF
+
+/* ----------------------------------------------------------
+ *  Tablice animacji
+ * ---------------------------------------------------------- */
+const uint8_t snakeTable[] = {
+    0x07, 0x0E, 0x1C, 0x38, 0x70, 0xE0,
+    0x70, 0x38, 0x1C, 0x0E, 0x07
+};
+
+const uint8_t queueTable[] = {
+    0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+    0x81,0x82,0x84,0x88,0x90,0xA0,0xC0,0xC1,
+    0xC2,0xC4,0xC8,0xD0,0xE0,0xE1,0xE2,0xE4,
+    0xE8,0xF0,0xF1,0xF2,0xF4,0xF8,0xF9,0xFA,
+    0xFC,0xFD,0xFF
+};
+
+/* ----------------------------------------------------------
+ *  Zmienne globalne
+ * ---------------------------------------------------------- */
+uint8_t portValue   = 0;
+uint8_t bcd_units   = 0, bcd_tens = 0;
+uint8_t snakeIndex  = 0, queueIndex = 0;
+
+/* 7‑bitowy LFSR – taps x7 ⊕ x6 ⊕ 1  →  sekwencja 127 stanów */
+uint8_t generator   = 0b1110011;      
+
+uint8_t prevS6 = 1, prevS7 = 1;       // detekcja zboczy
+uint8_t program = 0;                  // bieżący efekt 0‑8
+
+/* ----------------------------------------------------------
+ *  Prototypy
+ * ---------------------------------------------------------- */
+static inline void odczytajPrzyciski(void);
+static inline void resetStany(void);
+
+/* ----------------------------------------------------------
+ *  Obsługa przycisków (debounce ~3,75 ms)
+ * ---------------------------------------------------------- */
+static inline void odczytajPrzyciski(void)
+{
+    uint8_t nowS6 = PORTDbits.RD6;
+    uint8_t nowS7 = PORTDbits.RD7;
+
+    __delay32(15000);                 // ~3,75 ms przy FCY=4 MHz
+
+    if (prevS6 && !nowS6)             // S6 – następny efekt
+        program = (program == 8) ? 0 : program + 1;
+
+    if (prevS7 && !nowS7)             // S7 – poprzedni efekt
+        program = (program == 0) ? 8 : program - 1;
+
+    prevS6 = nowS6;
+    prevS7 = nowS7;
+}
+
+/* ----------------------------------------------------------
+ *  Reset wszystkich zmiennych animacji
+ * ---------------------------------------------------------- */
+static inline void resetStany(void)
+{
+    portValue   = 0;
+    bcd_units   = 0;
+    bcd_tens    = 0;
+    snakeIndex  = 0;
+    queueIndex  = 0;
+    generator   = 0b1110011;
+}
+
+/* ----------------------------------------------------------
+ *  Timer‑1 ISR  –  wywołanie co ~262 ms
+ * ---------------------------------------------------------- */
+void __attribute__((interrupt, no_auto_psv)) _T1Interrupt(void)
+{
+    switch (program)
+    {
+        case 0: LATA = portValue++;                           break;  // bin up
+        case 1: LATA = portValue--;                           break;  // bin down
+        case 2: portValue++; LATA = portValue ^ (portValue>>1);break; // Gray up
+        case 3: portValue--; LATA = portValue ^ (portValue>>1);break; // Gray down
+        case 4:                                                /* BCD up */
+            if (++bcd_units > 9) { bcd_units = 0; bcd_tens = (bcd_tens+1)%10; }
+            LATA = (bcd_tens<<4) | bcd_units;                 break;
+        case 5:                                                /* BCD down */
+            if (!bcd_units) { bcd_units = 9; bcd_tens = bcd_tens ? bcd_tens-1 : 9; }
+            else --bcd_units;
+            LATA = (bcd_tens<<4) | bcd_units;                 break;
+        case 6: LATA = snakeTable[snakeIndex++];
+                if (snakeIndex >= sizeof(snakeTable)) snakeIndex = 0; break;
+        case 7: LATA = queueTable[queueIndex++];
+                if (queueIndex >= sizeof(queueTable)) queueIndex = 0; break;
+        case 8:                                                /* 7‑bit LFSR */
+            generator = ((generator>>1) |
+                        (((generator>>6) ^ (generator>>5)) & 1) << 6) & 0x7F;
+            LATA = generator;                                 break;
+    }
+    _T1IF = 0;                         // skasuj flagę przerwania
+}
+
+/* ----------------------------------------------------------
+ *  Funkcja main()
+ * ---------------------------------------------------------- */
+int main(void)
+{
+    /* --- I/O --- */
+    TRISA = 0x0000;                   // RA0‑RA7 = wyjścia (LED)
+    AD1PCFG = 0xFFFF;                 // wszystkie wejścia cyfrowe
+    TRISD |= (1<<6) | (1<<7);         // RD6, RD7 = wejścia (przyciski)
+
+    /* --- Timer‑1: preskaler 1:256, okres ≈262 ms --- */
+    T1CON = 0x8030;                   // TON=1, TCKPS=11b
+    TMR1  = 0;                        // wyzeruj licznik
+    PR1   = 0x0FFF;
+    _T1IF = 0;                        // skasuj flagę *przed* enable
+    _T1IP = 1;                        // priorytet
+    _T1IE = 1;                        // włącz przerwania
+
+    resetStany();
+
+    while (1)
+        odczytajPrzyciski();          // pętla główna
+}
+/* ---------------------------- EOF --------------------------- */
