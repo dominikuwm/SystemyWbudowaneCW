@@ -1,0 +1,168 @@
+#include "xc.h"
+#include <stdint.h>
+#include <libpic30.h>
+
+//----------------------------------------------------------------------------
+// KONFIGURACJA
+//----------------------------------------------------------------------------
+#pragma config POSCMOD = NONE
+#pragma config OSCIOFNC = OFF
+#pragma config FCKSM = CSDCMD
+#pragma config FNOSC = FRC
+#pragma config IESO = OFF
+
+#pragma config WDTPS = PS32768
+#pragma config FWPSA = PR128
+#pragma config WINDIS = ON
+#pragma config FWDTEN = OFF
+#pragma config ICS = PGx2
+#pragma config GWRP = OFF
+#pragma config GCP = OFF
+#pragma config JTAGEN = OFF
+
+//----------------------------------------------------------------------------
+// STAŁE I ZMIENNE GLOBALNE
+//----------------------------------------------------------------------------
+
+#define BIT_VALUE(value,noBit) ((value >> (noBit)) & 1)
+
+const uint8_t snakeTable[] = {
+    0x07, 0x0E, 0x1C, 0x38, 0x70, 0xE0, 0x70, 0x38, 0x1C, 0x0E, 0x07
+};
+
+const uint8_t queueTable[] = {
+    0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+    0x81,0x82,0x84,0x88,0x90,0xA0,0xC0,0xC1,
+    0xC2,0xC4,0xC8,0xD0,0xE0,0xE1,0xE2,0xE4,
+    0xE8,0xF0,0xF1,0xF2,0xF4,0xF8,0xF9,0xFA,
+    0xFC,0xFD,0xFF
+};
+
+// Zmienne dla efektów
+uint8_t portValue = 0;
+uint8_t bcd_units = 0, bcd_tens = 0;
+uint8_t snakeIndex = 0;
+uint8_t queueIndex = 0;
+uint8_t generator = 0b1110011;
+
+// Zmienne do obsługi przycisków
+uint8_t prevS6 = 1, prevS7 = 1;
+uint8_t program = 0; // 0-8, tryby efektów
+
+//----------------------------------------------------------------------------
+// FUNKCJE POMOCNICZE
+//----------------------------------------------------------------------------
+
+void odczytajPrzyciski(void) {
+    uint8_t nowS6 = PORTDbits.RD6;
+    uint8_t nowS7 = PORTDbits.RD13;
+
+    __delay32(15000); // Eliminacja drgań styków
+
+    if (prevS6 == 1 && nowS6 == 0) { // Przycisk S6 w dół
+        program = (program == 8) ? 0 : program + 1;
+    }
+
+    if (prevS7 == 1 && nowS7 == 0) { // Przycisk S7 w dół
+        program = (program == 0) ? 8 : program - 1;
+    }
+
+    prevS6 = nowS6;
+    prevS7 = nowS7;
+}
+
+void resetStany() {
+    portValue = 0;
+    bcd_units = 0;
+    bcd_tens = 0;
+    snakeIndex = 0;
+    queueIndex = 0;
+    generator = 0b1110011;
+}
+
+//----------------------------------------------------------------------------
+// PRZERWANIE TIMERA1 - Sterowanie efektami
+//----------------------------------------------------------------------------
+
+void __attribute__((interrupt, no_auto_psv)) _T1Interrupt(void) {
+    switch (program) {
+        case 0: // Licznik binarny w górę
+            LATA = portValue++;
+            break;
+
+        case 1: // Licznik binarny w dół
+            LATA = portValue--;
+            break;
+
+        case 2: // Kod Graya w górę
+            portValue++;
+            LATA = portValue ^ (portValue >> 1);
+            break;
+
+        case 3: // Kod Graya w dół
+            portValue--;
+            LATA = portValue ^ (portValue >> 1);
+            break;
+
+        case 4: // Licznik BCD w górę
+            bcd_units++;
+            if (bcd_units > 9) {
+                bcd_units = 0;
+                bcd_tens = (bcd_tens + 1) % 10;
+            }
+            LATA = (bcd_tens << 4) | bcd_units;
+            break;
+
+        case 5: // Licznik BCD w dół
+            if (bcd_units == 0) {
+                bcd_units = 9;
+                bcd_tens = (bcd_tens == 0) ? 9 : bcd_tens - 1;
+            } else {
+                bcd_units--;
+            }
+            LATA = (bcd_tens << 4) | bcd_units;
+            break;
+
+        case 6: // Wężyk
+            LATA = snakeTable[snakeIndex++];
+            if (snakeIndex >= sizeof(snakeTable)) snakeIndex = 0;
+            break;
+
+        case 7: // Kolejka
+            LATA = queueTable[queueIndex++];
+            if (queueIndex >= sizeof(queueTable)) queueIndex = 0;
+            break;
+
+        case 8: // Generator pseudolosowy (LFSR)
+            generator = ((generator >> 1) | (((generator >> 5) ^ (generator >> 4)) & 1) << 5) & 0x3F;
+            LATA = generator;
+            break;
+    }
+
+    _T1IF = 0; // Skasowanie flagi przerwania
+}
+
+//----------------------------------------------------------------------------
+// FUNKCJA MAIN
+//----------------------------------------------------------------------------
+
+int main(void) {
+    // Konfiguracja portów
+    TRISA = 0x0000; // PORTA jako wyjście (diody LED)
+    TRISD |= (1 << 6) | (1 << 13); // RD6 i RD13 jako wejścia (przyciski)
+    AD1PCFG = 0xFFFF; // Piny cyfrowe
+
+    // Konfiguracja Timer1
+    T1CON = 0x8030;   // Timer włączony, preskaler 1:256
+    PR1 = 0x0FFF;     // Częstotliwość wywołań przerwań
+    _T1IE = 1;        // Włącz przerwania Timer1
+    _T1IP = 1;        // Priorytet przerwania
+
+    resetStany();
+
+    while (1) {
+        odczytajPrzyciski();
+    }
+
+    return 0;
+}

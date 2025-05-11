@@ -1,0 +1,157 @@
+// 'C' source line config statements
+#pragma config POSCMOD = XT             // Primary Oscillator Select (XT Oscillator mode selected)
+#pragma config OSCIOFNC = ON            // Primary Oscillator Output Function (OSC2/CLKO/RC15 functions as port I/O (RC15))
+#pragma config FCKSM = CSDCMD           // Clock Switching and Monitor (Clock switching and Fail-Safe Clock Monitor are disabled)
+#pragma config FNOSC = PRI              // Oscillator Select (Primary Oscillator (XT, HS, EC))
+#pragma config IESO = ON                // Internal External Switch Over Mode (IESO mode (Two-Speed Start-up) enabled)
+ 
+// CONFIG1
+#pragma config WDTPS = PS32768          // Watchdog Timer Postscaler (1:32,768)
+#pragma config FWPSA = PR128            // WDT Prescaler (Prescaler ratio of 1:128)
+#pragma config WINDIS = ON              // Watchdog Timer Window (Standard Watchdog Timer enabled,(Windowed-mode is disabled))
+#pragma config FWDTEN = ON              // Watchdog Timer Enable (Watchdog Timer is enabled)
+#pragma config ICS = PGx2               // Comm Channel Select (Emulator/debugger uses EMUC2/EMUD2)
+#pragma config GWRP = OFF               // General Code Segment Write Protect (Writes to program memory are allowed)
+#pragma config GCP = OFF                // General Code Segment Code Protect (Code protection is disabled)
+#pragma config JTAGEN = OFF             // JTAG Port Enable (JTAG port is disabled)
+ 
+#include <xc.h>
+#include <stdint.h>
+#include <libpic30.h>  // dla __delay32()
+ 
+// Sta?e dane
+const uint8_t snakeTable[] = {
+    0x07, 0x0E, 0x1C, 0x38, 0x70, 0xE0,
+    0x70, 0x38, 0x1C, 0x0E, 0x07
+};
+ 
+const uint8_t queueTable[] = {
+    0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+    0x81,0x82,0x84,0x88,0x90,0xA0,0xC0,0xC1,
+    0xC2,0xC4,0xC8,0xD0,0xE0,0xE1,0xE2,0xE4,
+    0xE8,0xF0,0xF1,0xF2,0xF4,0xF8,0xF9,0xFA,
+    0xFC,0xFD,0xFF
+};
+ 
+// Inicjalizacja I/O
+void initIO(void) {
+    TRISA = 0x0000; // Port A jako wyj?cia (LED)
+    TRISD |= (1 << 6) | (1 << 13); // RD6 i RD13 jako wej?cia (przyciski)
+    AD1PCFG = 0xFFFF; // Wszystkie piny jako cyfrowe
+}
+ 
+int main(void) {
+    initIO();
+ 
+    // Zmienne do programów
+    uint8_t bin = 0;
+    uint8_t gray = 0;
+    uint8_t bcd_units = 0, bcd_tens = 0;
+    uint8_t generator = 0b1110011;
+ 
+    // Indeksy do efektów tablicowych
+    uint8_t snakeIndex = 0;
+    uint8_t queueIndex = 0;
+ 
+    // Obs?uga przycisków i wyboru trybu
+    uint8_t program = 1;
+    uint8_t prevProgram = 1;
+    uint8_t prev6 = 1, prev13 = 1;
+ 
+    while (1) {
+        // Odczyt przycisków
+        uint8_t now6 = PORTDbits.RD6;
+        uint8_t now13 = PORTDbits.RD13;
+ 
+        if (prev6 == 1 && now6 == 0) {
+            program++;
+            if (program > 9) program = 1;
+        }
+ 
+        if (prev13 == 1 && now13 == 0) {
+            if (program == 1) program = 9;
+            else program--;
+        }
+ 
+        prev6 = now6;
+        prev13 = now13;
+ 
+        // Reset przy zmianie programu
+        if (program != prevProgram) {
+            switch (program) {
+                case 1: bin = 0; break;
+                case 2: bin = 255; break;
+                case 3: gray = 0; break;
+                case 4: gray = 255; break;
+                case 5: bcd_units = 0; bcd_tens = 0; break;
+                case 6: bcd_units = 9; bcd_tens = 9; break;
+                case 7: snakeIndex = 0; break;
+                case 8: queueIndex = 0; break;
+                case 9: generator = 0b1110011; break;
+            }
+            prevProgram = program;
+        }
+ 
+        // G?ówna logika
+        switch (program) {
+            case 1: // Licznik binarny w gór?
+                LATA = bin++;
+                break;
+ 
+            case 2: // Licznik binarny w dó?
+                LATA = bin--;
+                break;
+ 
+            case 3: // Kod Graya w gór?
+                gray++;
+                LATA = gray ^ (gray >> 1);
+                break;
+ 
+            case 4: // Kod Graya w dó?
+                gray--;
+                LATA = gray ^ (gray >> 1);
+                break;
+ 
+            case 5: // BCD w gór?
+                bcd_units++;
+                if (bcd_units > 9) {
+                    bcd_units = 0;
+                    bcd_tens++;
+                    if (bcd_tens > 9) bcd_tens = 0;
+                }
+                LATA = (bcd_tens << 4) | bcd_units;
+                break;
+ 
+            case 6: // BCD w dó?
+                if (bcd_units == 0) {
+                    bcd_units = 9;
+                    if (bcd_tens == 0) bcd_tens = 9;
+                    else bcd_tens--;
+                } else {
+                    bcd_units--;
+                }
+                LATA = (bcd_tens << 4) | bcd_units;
+                break;
+ 
+            case 7: // W??yk
+                LATA = snakeTable[snakeIndex++];
+                if (snakeIndex >= sizeof(snakeTable)) snakeIndex = 0;
+                break;
+ 
+            case 8: // Kolejka
+                LATA = queueTable[queueIndex++];
+                if (queueIndex >= sizeof(queueTable)) queueIndex = 0;
+                break;
+ 
+            case 9: // Generator pseudolosowy (6-bit LFSR)
+                generator = ((generator >> 1) | (((generator >> 5) ^ (generator >> 4)) & 1) << 5) & 0x3F;
+                LATA = generator; 
+                break;
+ 
+        }
+ 
+        __delay32(1500000); 
+    }
+ 
+    return 0;
+}
