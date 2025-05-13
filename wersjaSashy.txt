@@ -1,233 +1,97 @@
-/*
- * File:   main.c
- * Author: local
- *
- * Created on 7 kwietnia 2025, 9:58
- */
-
-//----------------------------------------------------------------------------
-// KONFIGURACJA
-//----------------------------------------------------------------------------
-#pragma config POSCMOD = NONE       // Primary Oscillator Select (HS Oscillator mode selected)
-#pragma config OSCIOFNC = OFF       // Primary Oscillator Output Function (OSC2/CLKO/RC15 functions as CLKO (FOSC/2))
-#pragma config FCKSM = CSDCMD       // Clock Switching and Monitor (disabled)
-#pragma config FNOSC = FRC          // Oscillator Select (FRC)
-#pragma config IESO = OFF           // Internal External Switch Over Mode (disabled)
-
-// CONFIG1
-#pragma config WDTPS = PS32768      // Watchdog Timer Postscaler (1:32,768)
-#pragma config FWPSA = PR128        // WDT Prescaler (1:128)
-#pragma config WINDIS = ON          // Standard Watchdog Timer
-#pragma config FWDTEN = OFF         // Watchdog Timer disabled
-#pragma config ICS = PGx2           // Comm Channel Select
-#pragma config GWRP = OFF           // General Code Segment Write Protect (disabled)
-#pragma config GCP = OFF            // General Code Segment Code Protect (disabled)
-#pragma config JTAGEN = OFF         // JTAG Port Enable (disabled)
-
-
-// BIBLIOTEKI
-
+#define FCY 4000000UL
 #include "xc.h"
+#include <stdint.h>
 #include <libpic30.h>
-#include <math.h>
 
 
-// DEFINICJE I ZMIENNE GLOBALNE
+#pragma config POSCMOD = NONE, FNOSC = FRC
+#pragma config FCKSM   = CSDCMD, IESO = OFF, OSCIOFNC = OFF
+#pragma config WDTPS   = PS32768, FWPSA = PR128, FWDTEN = OFF, WINDIS = ON
+#pragma config ICS     = PGx2,   GWRP = OFF,  GCP = OFF,   JTAGEN = OFF
 
-#define BIT_VALUE(value,noBit) ((value >> (noBit)) & 1)
+/* ----------- tablice animacji) ----------------- */
+static const uint8_t snakeTable[] = { 0x07,0x0E,0x1C,0x38,0x70,0xE0,0x70,0x38,0x1C,0x0E,0x07 };
+static const uint8_t queueTable[] = {
+    0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+    0x81,0x82,0x84,0x88,0x90,0xA0,0xC0,0xC1,
+    0xC2,0xC4,0xC8,0xD0,0xE0,0xE1,0xE2,0xE4,
+    0xE8,0xF0,0xF1,0xF2,0xF4,0xF8,0xF9,0xFA,
+    0xFC,0xFD,0xFF
+};
 
-// Zmienne używane w liczeniu, przechowywaniu stanów, itp.
-unsigned  portValue    = 0;
-unsigned  bcdValue     = 0;
-unsigned  snakeMove    = 0;
-unsigned  snakeDir     = 1;
-unsigned  queueMove    = 0;
-unsigned  queueBuffor  = 0;
-unsigned  tens         = 0;
-unsigned  ones         = 0;
-unsigned  queueEnd     = 0;
-unsigned  iq           = 7;
-unsigned  counter      = 0;
-unsigned  BIT          = 0;
 
-// Zmienne do obsługi przycisków
-char prevS6     = 6;
-char prevS7     = 7;
-char currentS6  = 0;
-char currentS7  = 0;
-char program    = 0;
+static uint8_t portValue = 0, bcd_units = 0, bcd_tens = 0;
+static uint8_t snakeIndex = 0, queueIndex = 0;
+static uint8_t generator = 0b1110011;      
+static uint8_t mode = 1;                   
 
-// Zmienne do generatora pseudolosowego
-int val = 1;
-int xor = 0;
+static uint8_t prevS6 = 1, prevS13 = 1;    
 
-// FUNKCJA SPRZĘŻENIA 
-int sprzezenie(unsigned int v) {
-    // Sprzężenie w oparciu o 1110011
-    return BIT_VALUE(v,0)
-         ^ BIT_VALUE(v,1)
-         ^ BIT_VALUE(v,2)
-         ^ BIT_VALUE(v,5)
-         ^ BIT_VALUE(v,6);
+
+static inline void resetStates(void)
+{
+    portValue = bcd_units = bcd_tens = 0;
+    snakeIndex = queueIndex = 0;
+    generator = 0b1110011;
 }
 
-// FUNKCJA PRZERWANIA TIMERA1
-void __attribute__((interrupt, no_auto_psv)) _T1Interrupt(void) {
-    
-    switch (program) {
+static inline void readButtons(void)
+{
+    uint8_t nowS6  = PORTDbits.RD6;   
+    uint8_t nowS13 = PORTDbits.RD13;  
 
-        // 1. Licznik binarny od 0 do 255
-        case 0:
-            portValue++;
-            LATA = portValue;
-            break;
+    __delay32(15000);                 
 
-        // 2. Licznik binarny od 255 do 0
-        case 1:
-            portValue--;
-            LATA = portValue;
-            break;
-
-        // 3. Licznik w kodzie Graya od 0 do 255
-        case 2:
-            portValue++;
-            LATA = (portValue >> 1) ^ portValue;
-            break;
-
-        // 4. Licznik w kodzie Graya od 255 do 0
-        case 3:
-            portValue--;
-            LATA = (portValue >> 1) ^ portValue;
-            break;
-
-        // 5. Licznik BCD od 0 do 99
-        case 4:
-            bcdValue++;
-            ones = bcdValue % 10;
-            tens = (bcdValue - ones) / 10;
-            LATA = (tens * pow(2,4)) + ones;
-            break;
-
-        // 6. Licznik BCD od 99 do 0
-        case 5:
-            bcdValue--;
-            ones = bcdValue % 10;
-            tens = (bcdValue - ones) / 10;
-            LATA = (tens * pow(2,4)) + ones;
-            break;
-
-        // 7. Wężyk poruszający się lewo-prawo (3-bitowy)
-        case 6:
-            if (snakeDir == 1) {
-                if (snakeMove >= 5) {
-                   snakeDir = 0;
-                } else {
-                    snakeMove++;
-                }
-            } else {
-                if (snakeMove == 0) {
-                    snakeDir = 1;
-                } else {
-                    snakeMove--;
-                }
-            }
-            LATA = (0x07 << snakeMove);
-            break;
-
-
-        // 8. Kolejka
-        case 7:
-            queueMove = 1 * pow(2, queueBuffor);
-            if (queueBuffor == iq) {
-                queueEnd = 255 - (pow(2, iq) - 1);
-                iq--;
-                queueMove    = 0;
-                queueBuffor  = 0;
-                LATA         = queueEnd;
-            }
-            else {
-                LATA = queueEnd + queueMove;
-                queueBuffor++;
-            }
-            break;
-
-        // 9. Generator liczb pseudolosowych w oparciu o 1110011
-        case 8:
-            for(int i = 0; i < 5; i++) {
-                xor = sprzezenie(val);
-                val = val >> 1;
-                val += (xor << 7);
-                LATA = val;
-            }
-            break;
+    if (prevS13 && !nowS13) {         
+        mode = (mode == 9) ? 1 : mode + 1;
+        resetStates();
     }
-    
-    _T1IF = 0;  // skasowanie flagi przerwania
+    if (prevS6 && !nowS6) {           
+        mode = (mode == 1) ? 9 : mode - 1;
+        resetStates();
+    }
+    prevS6 = nowS6;
+    prevS13 = nowS13;
 }
 
 
-// FUNKCJE POMOCNICZE DO OBSŁUGI PRZYCISKÓW I ZAKRESÓW
-void odczytajPrzyciski(void) {
-    // Zapamiętanie stanu przycisków przed krótkim opóźnieniem
-    prevS6 = PORTDbits.RD6;
-    prevS7 = PORTDbits.RD13;
-    __delay32(15000);     // eliminacja drgań styków
-    //for (volatile long i = 0; i < 50000; i++);
-    currentS6 = PORTDbits.RD6;
-    currentS7 = PORTDbits.RD13;
-
-    // Przyciśnięcie RD6 -> poprzedni program
-    if ((currentS6 - prevS6) == -1) {
-        program--;
+void __attribute__((interrupt, no_auto_psv)) _T1Interrupt(void)
+{
+    switch (mode)
+    {
+        case 1:  LATA = portValue++;                                   break;
+        case 2:  LATA = portValue--;                                   break;
+        case 3:  portValue++;  LATA = portValue ^ (portValue>>1);      break;
+        case 4:  portValue--;  LATA = portValue ^ (portValue>>1);      break;
+        case 5:  if (++bcd_units > 9) { bcd_units = 0; bcd_tens = (bcd_tens+1)%10; }
+                 LATA = (bcd_tens<<4) | bcd_units;                     break;
+        case 6:  if (!bcd_units) { bcd_units = 9; bcd_tens = bcd_tens ? bcd_tens-1 : 9; }
+                 else --bcd_units;
+                 LATA = (bcd_tens<<4) | bcd_units;                     break;
+        case 7:  LATA = snakeTable[snakeIndex++];
+                 if (snakeIndex >= sizeof(snakeTable)) snakeIndex = 0; break;
+        case 8:  LATA = queueTable[queueIndex++];
+                 if (queueIndex >= sizeof(queueTable)) queueIndex = 0; break;
+        case 9:  generator = ((generator>>1) |
+                         (((generator>>6) ^ (generator>>5)) & 1) << 6) & 0x7F;
+                 LATA = generator;                                     break;
     }
-    // Przyciśnięcie RD7 -> następny program
-    if ((currentS7 - prevS7) == -1) {
-        program++;
-    }
-}
-// Sprawdzanie numeru programu
-void sprawdzZakresProgramu(void) {
-    if (program > 8) program = 0;
-    if (program < 0) program = 8;
-}
-// Zmienna pomocnicza dla kodu BCD
-void kontrolaBCD(void) {
-    if (bcdValue > 99) bcdValue = 1;
-    if (bcdValue == 0) bcdValue = 99;
-}
-// Kontrola parametrów kolejki
-void kontrolaKolejki(void) {
-    if (queueBuffor > 8) queueBuffor = 0;
-    if (iq == 0) {
-        iq          = 7;
-        queueBuffor = 0;
-        queueEnd    = 0;
-    }
+    _T1IF = 0;
 }
 
-// FUNKCJA MAIN
-int main(void) {
-    
-    // Ustawienia portów
-    TRISA = 0x0000; // PORTA jako wyjście
-    TRISD = 0xFFFF; // PORTD jako wejście
-    
-    // Konfiguracja Timera1
-    T1CON  = 0x8030; // Timer włączony, preskaler 1:256
-    _T1IE  = 1;      // Zezwolenie na przerwanie
-    _T1IP  = 1;      // Priorytet przerwania
-    PR1    = 0x0FFF; // Okres przerwań
-    
-    while(1) {
-        // Odczyt i obsługa przycisków
-        odczytajPrzyciski();
-        // Upewnienie się, że program mieści się w zakresie 0..8
-        sprawdzZakresProgramu();
-        // Kontrola zakresu licznika BCD
-        kontrolaBCD();
-        // Kontrola parametrów kolejki
-        kontrolaKolejki();
-    }
-    
-    return 0;
+/* ----------- main() --------------------------------------- */
+int main(void)
+{
+    TRISA   = 0x0000;                 
+    AD1PCFG = 0xFFFF;
+
+    TRISD |= (1<<6) | (1<<13);        
+
+    T1CON = 0x8030;                   
+    TMR1 = 0;  PR1 = 0x0FFF;
+    _T1IF = 0;  _T1IP = 1;  _T1IE = 1;
+
+    resetStates();
+    while (1)
+        readButtons();
 }
