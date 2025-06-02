@@ -1,0 +1,140 @@
+#define FCY 4000000UL
+#include <xc.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <libpic30.h>
+#include "lcd.h"
+
+/* ------------------------------------------------------
+ *  Konfiguracja bitów (oscylator wewnętrzny FRC, watchdog off)
+ * ----------------------------------------------------*/
+#pragma config POSCMOD = NONE, FNOSC = FRC
+#pragma config FCKSM = CSDCMD, IESO = OFF, OSCIOFNC = OFF
+#pragma config WDTPS = PS32768, FWPSA = PR128, FWDTEN = OFF, WINDIS = ON
+#pragma config ICS   = PGx2, GWRP = OFF, GCP = OFF, JTAGEN = OFF
+
+/* ---------------- Stałe aplikacyjne -----------------*/
+#define BTN_MIN      PORTDbits.RD6   // +1 minuta
+#define BTN_SEC      PORTDbits.RD7   // +10 sekund
+#define BTN_START    PORTDbits.RD13  // Start / Stop
+
+#define DEBOUNCE_DELAY_US 15000
+
+/* 1‑sekundowy tick timera 1 (FCY = 4 MHz, preskaler 1:256) */
+#define TMR1_PRESCALER 0b11        // 1:256
+#define TMR1_PERIOD    15624       // (4 MHz / 256) − 1
+
+/* ---------------- Zmienne globalne -------------------*/
+static volatile uint32_t remainingSec = 0;   // pozostały czas [s]
+static volatile bool     running      = false;
+
+/* poprzedni stan przycisków (do detekcji zbocza) */
+static uint8_t prevMin = 1, prevSec = 1, prevStart = 1;
+
+/* ---------------- Prototypy -------------------------*/
+static void initIO(void);
+static void initTimer1(void);
+static void readButtons(void);
+static void updateLCD(void);
+
+/* ---------------- Implementacja ---------------------*/
+static void initIO(void)
+{
+    TRISA = 0x0000;          // port A jako wyjście (LEDy opcjonalnie)
+    TRISD |= (1u<<6) | (1u<<7) | (1u<<13); // RD6, RD7, RD13 jako wejścia
+    AD1PCFG = 0xFFFF;        // wszystkie piny cyfrowe
+}
+
+static void initTimer1(void)
+{
+    T1CON = 0;                       // reset
+    T1CONbits.TCKPS = TMR1_PRESCALER;// preskaler 1:256
+    PR1   = TMR1_PERIOD;             // okres 1 s
+    _T1IF = 0;
+    _T1IP = 2;
+    _T1IE = 1;                       // włącz przerwanie
+    T1CONbits.TON = 1;               // start timera
+}
+
+/* ----------------- ISR Timera1 -----------------------*/
+void __attribute__((interrupt, no_auto_psv)) _T1Interrupt(void)
+{
+    if (running && remainingSec) {
+        remainingSec--;              // dekrementacja czasu
+        if (remainingSec == 0) {
+            running = false;         // koniec odliczania
+        }
+    }
+    _T1IF = 0;                       // skasuj flagę
+}
+
+/* -----------------------------------------------------*/
+static inline uint8_t debounce(uint8_t *prev, uint8_t now)
+{
+    __delay32(DEBOUNCE_DELAY_US);    // ~15 ms przy FCY=4 MHz
+    uint8_t pressed = (*prev && !now);
+    *prev = now;
+    return pressed;
+}
+
+static void readButtons(void)
+{
+    if (debounce(&prevMin, BTN_MIN)) {
+        if (!running) remainingSec += 60;  // +1 minuta tylko gdy STOP
+    }
+
+    if (debounce(&prevSec, BTN_SEC)) {
+        if (!running) remainingSec += 10;  // +10 s
+    }
+
+    if (debounce(&prevStart, BTN_START)) {
+        if (running) {
+            running = false;              // Stop
+        } else if (remainingSec) {
+            running = true;               // Start (jeśli czas > 0)
+        }
+    }
+}
+
+static void formatTime(char *buf, uint32_t sec)
+{
+    uint16_t m = sec / 60;
+    uint16_t s = sec % 60;
+    sprintf(buf, "%02u:%02u", m, s);
+}
+
+static void updateLCD(void)
+{
+    char line[17];
+
+    LCD_ClearScreen();
+
+    // wiersz 0: czas
+    formatTime(line, remainingSec);
+    LCD_PutString("Czas: ", 6);
+    LCD_PutString(line, 5);
+
+    // wiersz 1: status
+    LCD_PutString("\n", 1); // przejście do 2‑giego wiersza
+    if (running) {
+        LCD_PutString("> Trwa podgrz.", 15);
+    } else if (remainingSec == 0) {
+        LCD_PutString("Gotowe!", 8);
+    } else {
+        LCD_PutString("Ustaw czas", 10);
+    }
+}
+
+int main(void)
+{
+    initIO();
+    LCD_Initialize();
+    initTimer1();
+
+    while (1)
+    {
+        readButtons();      // obsługa przycisków + modyf. remainingSec / running
+        updateLCD();        // odśwież LCD
+        __delay_ms(200);    // prosty throttling odświeżania
+    }
+}
