@@ -1,0 +1,162 @@
+#define FCY 4000000UL
+#include <xc.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <libpic30.h>
+#include "lcd.h"
+
+#pragma config POSCMOD = NONE, FNOSC = FRC
+#pragma config FCKSM   = CSDCMD, IESO = OFF, OSCIOFNC = OFF
+#pragma config WDTPS   = PS32768, FWPSA = PR128, FWDTEN = OFF, WINDIS = ON
+#pragma config ICS     = PGx2, GWRP = OFF,  GCP = OFF,  JTAGEN = OFF
+
+#ifndef SYSTEM_PERIPHERAL_CLOCK
+#define SYSTEM_PERIPHERAL_CLOCK FCY
+#endif
+
+
+#define BTN_MIN    PORTDbits.RD6   
+#define BTN_SEC    PORTDbits.RD7   
+#define BTN_START  PORTDbits.RD13  
+#define DEBOUNCE_DELAY_US 5000
+#define T1_PRESCALER 0b11
+#define T1_PERIOD    15624
+
+
+static volatile uint32_t remainingSec = 0;   
+static volatile bool     running      = false;
+
+static uint8_t prevMin, prevSec, prevStart;  
+
+static void initIO(void);
+static void initTimer1(void);
+static void readButtons(void);
+static void updateLCD(void);
+static void formatTime(char *buf, uint32_t sec);
+
+
+static void initIO(void)
+{
+    AD1PCFG = 0xFFFF;                       
+    TRISA   = 0x0000;                       
+    TRISD  |= (1u<<6) | (1u<<7) | (1u<<13); 
+
+ 
+    prevMin   = BTN_MIN;
+    prevSec   = BTN_SEC;
+    prevStart = BTN_START;
+}
+
+static void initTimer1(void)
+{
+    T1CON = 0;
+    T1CONbits.TCKPS = T1_PRESCALER;   
+    PR1 = T1_PERIOD;                 
+    _T1IF = 0;
+    _T1IP = 2;
+    _T1IE = 1;
+    T1CONbits.TON = 1;                
+}
+
+void __attribute__((interrupt, no_auto_psv)) _T1Interrupt(void)
+{
+    if (running && remainingSec) {
+        remainingSec--;               
+        if (remainingSec == 0) {
+            running = false;          
+        }
+    }
+    _T1IF = 0;
+}
+
+
+static void readButtons(void)
+{
+    
+    if (prevMin && !BTN_MIN) {
+        __delay_us(DEBOUNCE_DELAY_US);
+        if (prevMin && !BTN_MIN) {         
+            if (!running) remainingSec += 60;
+        }
+    }
+    prevMin = BTN_MIN;
+
+    
+    if (prevSec && !BTN_SEC) {
+        __delay_us(DEBOUNCE_DELAY_US);
+        if (prevSec && !BTN_SEC) {
+            if (!running) remainingSec += 10;
+        }
+    }
+    prevSec = BTN_SEC;
+
+    
+    if (prevStart && !BTN_START) {
+        __delay_us(DEBOUNCE_DELAY_US);
+        if (prevStart && !BTN_START) {
+            if (running) {
+                running = false;          
+            } else if (remainingSec) {
+                running = true;           
+            }
+        }
+    }
+    prevStart = BTN_START;
+}
+
+
+static void formatTime(char *buf, uint32_t sec)
+{
+    uint16_t m = sec / 60;
+    uint16_t s = sec % 60;
+    sprintf(buf, "%02u:%02u", m, s);
+}
+
+
+static void updateLCD(void)
+{
+    static uint32_t lastSec = 0xFFFFFFFF;
+    static bool     lastRun = false;
+
+    if (remainingSec == lastSec && running == lastRun) return; 
+
+    lastSec = remainingSec;
+    lastRun = running;
+
+    char buf[6];
+    LCD_ClearScreen();
+    LCD_PutString("Czas: ", 6);
+    formatTime(buf, remainingSec);
+    LCD_PutString(buf, 5);
+
+    LCD_PutString("\n", 1);
+    if (running) {
+        LCD_PutString("> Podgrzewanie…", 16);
+    } else if (remainingSec == 0) {
+        LCD_PutString("Gotowe!          ", 16);
+    } else {
+        LCD_PutString("Ustaw czas       ", 16);
+    }
+}
+
+
+int main(void)
+{
+    initIO();
+    LCD_Initialize();
+    initTimer1();
+
+    uint8_t lcdCtr = 0; 
+
+    while (1) {
+        readButtons();                
+
+        if (++lcdCtr >= 20) {
+            updateLCD();
+            lcdCtr = 0;
+        }
+
+        __delay_ms(10);
+    }
+}
